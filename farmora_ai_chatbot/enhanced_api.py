@@ -1,47 +1,33 @@
-# Farmora AI - Scalable API (10K Users Ready)
-
 import os
 import uuid
 import base64
 import asyncio
 import logging
-import hashlib
 from datetime import datetime
 from typing import Optional
 
 import httpx
-import redis.asyncio as redis
-from aiolimiter import AsyncLimiter
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
+from pydantic import BaseModel, Field
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# ================= CONFIG =================
 load_dotenv()
 
 APP_NAME = "Farmora"
 MODEL_NAME = "gemini-2.5-flash"
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("farmora")
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL")  # Render Redis
+if not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY not set")
 
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel(MODEL_NAME)
 
-# Redis (cache)
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-
-# Rate limiter (100 requests per minute per instance)
-limiter = AsyncLimiter(100, 60)
-
-# Shared HTTP client
-http_client = httpx.AsyncClient(timeout=5.0)
-
-# ================= APP =================
 app = FastAPI(title="Farmora API", version="3.0.0")
 
 app.add_middleware(
@@ -52,10 +38,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================= MODELS =================
+
 class LocationInfo(BaseModel):
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(None)
+    longitude: Optional[float] = Field(None)
+    town: Optional[str] = None
+    province: Optional[str] = None
+    country: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -63,119 +52,192 @@ class ChatRequest(BaseModel):
     imageBase64: Optional[str] = None
     location: Optional[LocationInfo] = None
     audioBase64: Optional[str] = None
+    transcript: Optional[str] = None
 
 
-# ================= HELPERS =================
-def hash_input(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
+class ChatResponse(BaseModel):
+    id: str
+    response: str
+    timestamp: str
+    location: str
+    hasAudio: bool
+    transcript: str
 
 
-async def get_cached(key: str):
-    return await redis_client.get(key)
-
-
-async def set_cache(key: str, value: str, ttl=3600):
-    await redis_client.set(key, value, ex=ttl)
-
-
-def detect_audio(audio_base64):
-    if not audio_base64:
-        return False
-    try:
-        return len(base64.b64decode(audio_base64)) > 2000
-    except:
-        return False
-
-
-async def resolve_location(location: Optional[LocationInfo]):
-    if location and location.latitude and location.longitude:
+class LocationService:
+    @staticmethod
+    async def reverse_geocode(lat: float, lon: float) -> str:
         try:
-            res = await http_client.get(
-                "https://nominatim.openstreetmap.org/reverse",
-                params={
-                    "lat": location.latitude,
-                    "lon": location.longitude,
-                    "format": "json"
-                }
-            )
+            url = "https://nominatim.openstreetmap.org/reverse"
+            params = {"lat": lat, "lon": lon, "format": "json"}
+
+            async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "Farmora/1.0"}) as client:
+                res = await client.get(url, params=params)
+
             if res.status_code == 200:
                 data = res.json()
-                return data.get("display_name", "Unknown location")
-        except:
-            pass
-    return "Unknown location"
+                address = data.get("address", {})
+                city = (
+                    address.get("city")
+                    or address.get("town")
+                    or address.get("village")
+                    or address.get("hamlet")
+                    or ""
+                )
+                state = address.get("state", "")
+                country = address.get("country", "")
+                parts = [city, state, country]
+                return ", ".join([p for p in parts if p]) or "Unknown location"
+        except Exception as e:
+            logger.warning(f"Reverse geocoding failed: {e}")
+
+        return "Unknown location"
+
+    @staticmethod
+    async def resolve(location: Optional[LocationInfo]) -> str:
+        if location:
+            if location.latitude and location.longitude:
+                return await LocationService.reverse_geocode(
+                    location.latitude, location.longitude
+                )
+            parts = [location.town, location.province, location.country]
+            text = ", ".join([p for p in parts if p])
+            if text:
+                return text
+        return "Unknown location"
 
 
-# ================= AI =================
-async def generate_text(prompt: str):
-    return await asyncio.to_thread(model.generate_content, prompt)
+class AudioService:
+    @staticmethod
+    def detect(audio_base64: Optional[str]) -> bool:
+        if not audio_base64:
+            return False
+        try:
+            audio_bytes = base64.b64decode(audio_base64)
+            return len(audio_bytes) > 2000
+        except Exception:
+            return False
 
 
-async def analyze_image(image_base64, location):
-    image_bytes = base64.b64decode(image_base64)
+class AIService:
+    @staticmethod
+    async def generate_text(prompt: str) -> str:
+        try:
+            response = await asyncio.to_thread(model.generate_content, prompt)
+            text = getattr(response, "text", "") or ""
+            return text.strip()
+        except Exception as e:
+            logger.error(f"AI text error: {e}")
+            raise
 
-    prompt = f"""
-    Farmer location: {location}
+    @staticmethod
+    async def analyze_image(image_base64: str, location: str, user_text: str = "") -> str:
+        try:
+            image_bytes = base64.b64decode(image_base64)
 
-    Analyze crop:
-    - Plant
-    - Health
-    - Issue
-    - Fix
-    """
+            prompt = f"""
+You are an expert agricultural AI assistant.
 
-    return await asyncio.to_thread(
-        model.generate_content,
-        [prompt, {"mime_type": "image/jpeg", "data": image_bytes}]
-    )
+Farmer location: {location}
+
+Analyze this crop image and give a clean response with:
+1. Crop uploaded in the image
+2. Confidence score
+3. What is wrong with the plant, if anything
+4. How to solve the problem
+5. How to prevent it in future
+
+Keep it practical, location-aware, and easy to understand.
+User message: {user_text}
+"""
+
+            response = await asyncio.to_thread(
+                model.generate_content,
+                [prompt, {"mime_type": "image/jpeg", "data": image_bytes}],
+            )
+
+            text = getattr(response, "text", "") or ""
+            return text.strip()
+        except Exception as e:
+            logger.error(f"Image analysis error: {e}")
+            raise
 
 
-# ================= ROUTE =================
-@app.post("/api/chat")
+@app.get("/")
+def root():
+    return {
+        "app": APP_NAME,
+        "status": "live",
+        "model": MODEL_NAME,
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "app": APP_NAME,
+        "model": MODEL_NAME,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request):
     request_id = str(uuid.uuid4())
 
-    async with limiter:  # rate limit
-        try:
-            location = await resolve_location(req.location)
-            has_audio = detect_audio(req.audioBase64)
+    try:
+        location_str = await LocationService.resolve(req.location)
+        has_audio = AudioService.detect(req.audioBase64)
+        transcript = (req.transcript or "").strip()
 
-            # 🔥 CACHE KEY
-            cache_key = hash_input(
-                (req.message or "") + (req.imageBase64 or "")
+        if req.imageBase64:
+            result = await AIService.analyze_image(
+                req.imageBase64,
+                location_str,
+                user_text=req.message or transcript,
             )
+        else:
+            user_input = transcript or req.message or "Hello"
 
-            cached = await get_cached(cache_key)
-            if cached:
-                return {
-                    "id": request_id,
-                    "response": cached,
-                    "cached": True
-                }
+            prompt = f"""
+You are a professional agricultural advisor.
 
-            # AI
-            if req.imageBase64:
-                ai_res = await analyze_image(req.imageBase64, location)
-            else:
-                ai_res = await generate_text(
-                    f"Location: {location}\nQuestion: {req.message}"
-                )
+Location: {location_str}
 
-            result = ai_res.text.strip()
+Farmer question:
+{user_input}
 
-            if not has_audio:
-                result += "\n\n(No audio detected)"
+Give a clear, practical, location-aware answer.
+"""
+            result = await AIService.generate_text(prompt)
 
-            # 🔥 STORE CACHE
-            await set_cache(cache_key, result)
+        logger.info(f"[{request_id}] Success")
 
-            return {
-                "id": request_id,
-                "response": result,
-                "cached": False,
-                "location": location
-            }
+        return ChatResponse(
+            id=request_id,
+            response=result,
+            timestamp=datetime.utcnow().isoformat(),
+            location=location_str,
+            hasAudio=has_audio,
+            transcript=transcript,
+        )
 
-        except Exception as e:
-            logging.error(f"[{request_id}] {e}")
-            raise HTTPException(status_code=500, detail="Server error")
+    except Exception as e:
+        logger.error(f"[{request_id}] Error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Something went wrong. Please try again."
+        )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "enhanced_api:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+    )
