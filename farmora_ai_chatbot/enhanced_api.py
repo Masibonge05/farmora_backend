@@ -87,28 +87,24 @@ def get_language_name(code: str) -> str:
 
 
 class LocationService:
+
     @staticmethod
     async def reverse_geocode(lat: float, lon: float) -> str:
         try:
             url = "https://nominatim.openstreetmap.org/reverse"
             params = {"lat": lat, "lon": lon, "format": "json"}
 
-            async with httpx.AsyncClient(
-                timeout=8.0,
-                headers={"User-Agent": "Farmora/1.0"}
-            ) as client:
+            async with httpx.AsyncClient(timeout=8.0,
+                                         headers={"User-Agent":
+                                                  "Farmora/1.0"}) as client:
                 res = await client.get(url, params=params)
 
             if res.status_code == 200:
                 data = res.json()
                 address = data.get("address", {})
-                city = (
-                    address.get("city")
-                    or address.get("town")
-                    or address.get("village")
-                    or address.get("hamlet")
-                    or ""
-                )
+                city = (address.get("city") or address.get("town")
+                        or address.get("village") or address.get("hamlet")
+                        or "")
                 state = address.get("state", "")
                 country = address.get("country", "")
                 parts = [city, state, country]
@@ -136,6 +132,7 @@ class LocationService:
 
 
 class AudioService:
+
     @staticmethod
     def detect(audio_base64: Optional[str]) -> bool:
         if not audio_base64:
@@ -148,6 +145,7 @@ class AudioService:
 
 
 class PromptService:
+
     @staticmethod
     def image_prompt(location: str, language_name: str, user_text: str) -> str:
         return f"""
@@ -221,6 +219,7 @@ User question:
 
 
 class AIService:
+
     @staticmethod
     async def generate_text(prompt: str) -> str:
         try:
@@ -244,8 +243,12 @@ class AIService:
             response = await asyncio.to_thread(
                 model.generate_content,
                 [
-                    PromptService.image_prompt(location, language_name, user_text),
-                    {"mime_type": "image/jpeg", "data": image_bytes},
+                    PromptService.image_prompt(location, language_name,
+                                               user_text),
+                    {
+                        "mime_type": "image/jpeg",
+                        "data": image_bytes
+                    },
                 ],
             )
 
@@ -300,7 +303,8 @@ async def chat(req: ChatRequest, request: Request):
         else:
             if not user_input:
                 user_input = "Give general farming guidance."
-            prompt = PromptService.text_prompt(location_str, language_name, user_input)
+            prompt = PromptService.text_prompt(location_str, language_name,
+                                               user_input)
             result = await AIService.generate_text(prompt)
 
         logger.info(f"[{request_id}] Success")
@@ -320,7 +324,7 @@ async def chat(req: ChatRequest, request: Request):
         raise HTTPException(
             status_code=500,
             detail="Something went wrong. Please try again.",
-        )
+        ) from e
 
 
 if __name__ == "__main__":
