@@ -28,7 +28,7 @@ if not GOOGLE_API_KEY:
 genai.configure(api_key=GOOGLE_API_KEY)
 model = genai.GenerativeModel(MODEL_NAME)
 
-app = FastAPI(title="Farmora API", version="3.0.0")
+app = FastAPI(title="Farmora API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,6 +53,7 @@ class ChatRequest(BaseModel):
     location: Optional[LocationInfo] = None
     audioBase64: Optional[str] = None
     transcript: Optional[str] = None
+    language: Optional[str] = "en"
 
 
 class ChatResponse(BaseModel):
@@ -62,6 +63,7 @@ class ChatResponse(BaseModel):
     location: str
     hasAudio: bool
     transcript: str
+    language: str
 
 
 class LocationService:
@@ -71,7 +73,10 @@ class LocationService:
             url = "https://nominatim.openstreetmap.org/reverse"
             params = {"lat": lat, "lon": lon, "format": "json"}
 
-            async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "Farmora/1.0"}) as client:
+            async with httpx.AsyncClient(
+                timeout=8.0,
+                headers={"User-Agent": "Farmora/1.0"}
+            ) as client:
                 res = await client.get(url, params=params)
 
             if res.status_code == 200:
@@ -98,12 +103,15 @@ class LocationService:
         if location:
             if location.latitude and location.longitude:
                 return await LocationService.reverse_geocode(
-                    location.latitude, location.longitude
+                    location.latitude,
+                    location.longitude,
                 )
+
             parts = [location.town, location.province, location.country]
             text = ", ".join([p for p in parts if p])
             if text:
                 return text
+
         return "Unknown location"
 
 
@@ -131,7 +139,12 @@ class AIService:
             raise
 
     @staticmethod
-    async def analyze_image(image_base64: str, location: str, user_text: str = "") -> str:
+    async def analyze_image(
+        image_base64: str,
+        location: str,
+        user_text: str = "",
+        language: str = "en",
+    ) -> str:
         try:
             image_bytes = base64.b64decode(image_base64)
 
@@ -139,6 +152,7 @@ class AIService:
 You are an expert agricultural AI assistant.
 
 Farmer location: {location}
+Reply language: {language}
 
 Analyze this crop image and give a clean response with:
 1. Crop uploaded in the image
@@ -147,6 +161,7 @@ Analyze this crop image and give a clean response with:
 4. How to solve the problem
 5. How to prevent it in future
 
+Respond fully in the requested language.
 Keep it practical, location-aware, and easy to understand.
 User message: {user_text}
 """
@@ -190,12 +205,14 @@ async def chat(req: ChatRequest, request: Request):
         location_str = await LocationService.resolve(req.location)
         has_audio = AudioService.detect(req.audioBase64)
         transcript = (req.transcript or "").strip()
+        language = (req.language or "en").strip()
 
         if req.imageBase64:
             result = await AIService.analyze_image(
                 req.imageBase64,
                 location_str,
                 user_text=req.message or transcript,
+                language=language,
             )
         else:
             user_input = transcript or req.message or "Hello"
@@ -204,10 +221,12 @@ async def chat(req: ChatRequest, request: Request):
 You are a professional agricultural advisor.
 
 Location: {location_str}
+Reply language: {language}
 
 Farmer question:
 {user_input}
 
+Respond fully in the requested language.
 Give a clear, practical, location-aware answer.
 """
             result = await AIService.generate_text(prompt)
@@ -221,13 +240,14 @@ Give a clear, practical, location-aware answer.
             location=location_str,
             hasAudio=has_audio,
             transcript=transcript,
+            language=language,
         )
 
     except Exception as e:
         logger.error(f"[{request_id}] Error: {e}")
         raise HTTPException(
             status_code=500,
-            detail="Something went wrong. Please try again."
+            detail="Something went wrong. Please try again.",
         )
 
 
