@@ -26,9 +26,16 @@ if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY not set")
 
 genai.configure(api_key=GOOGLE_API_KEY)
-model = genai.GenerativeModel(MODEL_NAME)
 
-app = FastAPI(title="Farmora API", version="4.0.0")
+model = genai.GenerativeModel(
+    MODEL_NAME,
+    generation_config=genai.types.GenerationConfig(
+        temperature=0.2,
+        max_output_tokens=1800,
+    ),
+)
+
+app = FastAPI(title="Farmora API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,6 +71,19 @@ class ChatResponse(BaseModel):
     hasAudio: bool
     transcript: str
     language: str
+
+
+LANGUAGE_NAMES = {
+    "en": "English",
+    "zu": "isiZulu",
+    "xh": "isiXhosa",
+    "af": "Afrikaans",
+    "st": "Sesotho",
+}
+
+
+def get_language_name(code: str) -> str:
+    return LANGUAGE_NAMES.get(code, "English")
 
 
 class LocationService:
@@ -127,6 +147,79 @@ class AudioService:
             return False
 
 
+class PromptService:
+    @staticmethod
+    def image_prompt(location: str, language_name: str, user_text: str) -> str:
+        return f"""
+You are Farmora AI, an expert agricultural assistant.
+
+Farmer location: {location}
+Reply language: {language_name}
+
+The user uploaded a plant or crop image.
+If the user also provided a question or transcript, use it as extra context.
+
+Return the answer in clean plain text only.
+Do not use markdown.
+Do not use asterisks.
+Do not use bullet symbols unless necessary.
+Use this exact structure with headings:
+
+Crop:
+Confidence:
+Health Status:
+Problem:
+Treatment:
+Prevention:
+
+Rules:
+- Identify the crop if possible.
+- Give a realistic confidence score as a percentage.
+- If the plant looks healthy, say so clearly in Health Status and Problem.
+- Treatment must explain what the farmer should do now.
+- Prevention must explain how to reduce future recurrence.
+- Keep the answer practical, easy to understand, and aware of the farmer's location.
+- If something is uncertain, say that clearly.
+
+User message or transcript:
+{user_text}
+"""
+
+    @staticmethod
+    def text_prompt(location: str, language_name: str, user_input: str) -> str:
+        return f"""
+You are Farmora AI, a professional agricultural advisor.
+
+Farmer location: {location}
+Reply language: {language_name}
+
+The user is asking a general farming question.
+Answer in clean plain text only.
+Do not use markdown.
+Do not use asterisks.
+
+If the question is general, use this structure:
+Answer:
+Practical Steps:
+Best Practice:
+
+If the question is specifically about a crop disease, deficiency, or plant issue without an image, you may also use:
+Problem:
+Treatment:
+Prevention:
+
+Rules:
+- Answer the user's actual question directly.
+- Make the answer practical and location-aware.
+- Do not mention suppliers.
+- Do not generate a PDF.
+- Keep the wording simple and useful for farmers.
+
+User question:
+{user_input}
+"""
+
+
 class AIService:
     @staticmethod
     async def generate_text(prompt: str) -> str:
@@ -143,32 +236,17 @@ class AIService:
         image_base64: str,
         location: str,
         user_text: str = "",
-        language: str = "en",
+        language_name: str = "English",
     ) -> str:
         try:
             image_bytes = base64.b64decode(image_base64)
 
-            prompt = f"""
-You are an expert agricultural AI assistant.
-
-Farmer location: {location}
-Reply language: {language}
-
-Analyze this crop image and give a clean response with:
-1. Crop uploaded in the image
-2. Confidence score
-3. What is wrong with the plant, if anything
-4. How to solve the problem
-5. How to prevent it in future
-
-Respond fully in the requested language.
-Keep it practical, location-aware, and easy to understand.
-User message: {user_text}
-"""
-
             response = await asyncio.to_thread(
                 model.generate_content,
-                [prompt, {"mime_type": "image/jpeg", "data": image_bytes}],
+                [
+                    PromptService.image_prompt(location, language_name, user_text),
+                    {"mime_type": "image/jpeg", "data": image_bytes},
+                ],
             )
 
             text = getattr(response, "text", "") or ""
@@ -205,30 +283,24 @@ async def chat(req: ChatRequest, request: Request):
         location_str = await LocationService.resolve(req.location)
         has_audio = AudioService.detect(req.audioBase64)
         transcript = (req.transcript or "").strip()
-        language = (req.language or "en").strip()
+        language = (req.language or "en").strip().lower()
+        language_name = get_language_name(language)
+
+        user_input = (req.message or "").strip()
+        if not user_input and transcript:
+            user_input = transcript
 
         if req.imageBase64:
             result = await AIService.analyze_image(
                 req.imageBase64,
                 location_str,
-                user_text=req.message or transcript,
-                language=language,
+                user_text=user_input,
+                language_name=language_name,
             )
         else:
-            user_input = transcript or req.message or "Hello"
-
-            prompt = f"""
-You are a professional agricultural advisor.
-
-Location: {location_str}
-Reply language: {language}
-
-Farmer question:
-{user_input}
-
-Respond fully in the requested language.
-Give a clear, practical, location-aware answer.
-"""
+            if not user_input:
+                user_input = "Give general farming guidance."
+            prompt = PromptService.text_prompt(location_str, language_name, user_input)
             result = await AIService.generate_text(prompt)
 
         logger.info(f"[{request_id}] Success")
